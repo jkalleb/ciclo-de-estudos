@@ -5,6 +5,7 @@ import sqlite3
 from datetime import date, datetime, timedelta
 import urllib.parse
 import json
+import re
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
@@ -15,17 +16,26 @@ DIFFICULTY_ORDER = ["Fácil", "Médio", "Difícil"]
 DIFF_FACTOR = {"Fácil": 1.0, "Médio": 1.3, "Difícil": 1.6}
 
 # ---------------------------
-# DB helpers
+# DB helpers + migration
 # ---------------------------
 def db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.execute("PRAGMA foreign_keys=ON;")
     return con
 
+def table_exists(con, name: str) -> bool:
+    row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+    return bool(row)
+
+def column_exists(con, table: str, column: str) -> bool:
+    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
+
 def init_db():
     con = db()
     cur = con.cursor()
 
+    # settings
     cur.execute("""
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -33,13 +43,26 @@ def init_db():
     );
     """)
 
+    # exams (concursos)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS exams (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    );
+    """)
+
+    # subjects per exam
     cur.execute("""
     CREATE TABLE IF NOT EXISTS subjects (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
+        exam_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
         weight INTEGER NOT NULL DEFAULT 1,
         exam_questions INTEGER NOT NULL DEFAULT 0,
-        difficulty TEXT NOT NULL DEFAULT 'Médio'
+        difficulty TEXT NOT NULL DEFAULT 'Médio',
+        UNIQUE(exam_id, name),
+        FOREIGN KEY(exam_id) REFERENCES exams(id) ON DELETE CASCADE
     );
     """)
 
@@ -86,7 +109,11 @@ def init_db():
     # defaults
     cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('revision_intervals','[1,7,15,30,60,120,180]');")
     cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('weekly_hours_available','20');")
+    con.commit()
 
+    # Ensure at least one exam
+    cur.execute("INSERT OR IGNORE INTO exams(name,created_at) VALUES(?,?)",
+                ("Meu Concurso", datetime.now().isoformat(timespec="seconds")))
     con.commit()
     con.close()
 
@@ -161,18 +188,13 @@ def add_study_record(topic_id: int, study_date: date, minutes: int, questions: i
         INSERT INTO study_records(topic_id, study_date, minutes, questions, correct, notes, created_at)
         VALUES (?,?,?,?,?,?,?)
     """, (topic_id, study_date.isoformat(), int(minutes), int(questions), int(correct), notes or "", datetime.now().isoformat(timespec="seconds")))
-    rec_id = cur.lastrowid
-
     if mark_studied:
         cur.execute("UPDATE topics SET studied=1 WHERE id=?", (topic_id,))
-
     first = cur.execute("SELECT MIN(study_date) FROM study_records WHERE topic_id=?", (topic_id,)).fetchone()[0]
     if first:
         ensure_revisions_for_topic(topic_id, date.fromisoformat(first))
-
     con.commit()
     con.close()
-    return rec_id
 
 # ---------------------------
 # Planning math
@@ -221,45 +243,87 @@ def evolution_status(coverage: float, accuracy: float) -> str:
     return "Iniciante"
 
 # ---------------------------
+# Bulk topic parser (":" delimiters)
+# ---------------------------
+def parse_bulk_topics(text: str) -> list[str]:
+    if not text:
+        return []
+    s = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if ":" not in s:
+        parts = [p.strip(" -\t") for p in s.split("\n")]
+        return [p for p in parts if p]
+    raw_parts = [p.strip() for p in s.split(":")]
+    topics = []
+    for p in raw_parts:
+        p = re.sub(r"^\d+[\)\.\-–—]*\s*", "", p).strip()
+        p = re.sub(r"\s+", " ", p).strip()
+        if len(p) >= 2:
+            topics.append(p)
+    seen = set()
+    out = []
+    for t in topics:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+# ---------------------------
 # UI
 # ---------------------------
-st.set_page_config(page_title="Ciclo de Estudos — 3 Tabelas", layout="wide")
+st.set_page_config(page_title="Ciclo de Estudos — Multi-Concurso", layout="wide")
 init_db()
 
-st.sidebar.title("Ciclo de Estudos")
-page = st.sidebar.radio("Abas", ["Tabela 1 — Painel Geral", "Tabela 2 — Revisões", "Tabela 3 — Evolução", "Configuração"])
+exams = load_df("SELECT id, name FROM exams ORDER BY name;")
+if "exam_id" not in st.session_state:
+    st.session_state.exam_id = int(exams.iloc[0]["id"]) if len(exams) else None
 
-subjects = load_df("SELECT * FROM subjects ORDER BY name;")
-topics = load_df("""
-    SELECT t.id as topic_id, t.name as topic, t.planned_hours, t.studied,
-           s.id as subject_id, s.name as subject, s.weight, s.exam_questions, s.difficulty
-    FROM topics t
-    JOIN subjects s ON s.id = t.subject_id
-    ORDER BY s.name, t.name
-""")
+st.sidebar.title("Ciclo de Estudos")
+
+exam_name_by_id = {int(r["id"]): r["name"] for _, r in exams.iterrows()} if len(exams) else {}
+exam_ids = [int(r["id"]) for _, r in exams.iterrows()] if len(exams) else []
+if exam_ids:
+    current_exam_id = st.sidebar.selectbox(
+        "Concurso (selecionar)",
+        options=exam_ids,
+        format_func=lambda x: exam_name_by_id.get(int(x), str(x)),
+        index=exam_ids.index(int(st.session_state.exam_id)) if int(st.session_state.exam_id) in exam_ids else 0
+    )
+    st.session_state.exam_id = int(current_exam_id)
+    current_exam_name = exam_name_by_id.get(int(current_exam_id), "Concurso")
+else:
+    current_exam_name = "Concurso"
 
 weekly_hours_available = float(get_setting("weekly_hours_available", "20") or 20)
 
-# ---------------------------
-# TABELA 1
-# ---------------------------
-if page == "Tabela 1 — Painel Geral":
-    st.title("📌 Tabela 1: Painel Geral de Performance e Execução")
+def load_subjects_topics_for_exam(exam_id: int):
+    subjects = load_df("SELECT * FROM subjects WHERE exam_id=? ORDER BY name;", (exam_id,))
+    topics = load_df("""
+        SELECT t.id as topic_id, t.name as topic, t.planned_hours, t.studied,
+               s.id as subject_id, s.name as subject, s.weight, s.exam_questions, s.difficulty
+        FROM topics t
+        JOIN subjects s ON s.id = t.subject_id
+        WHERE s.exam_id=?
+        ORDER BY s.name, t.name
+    """, (exam_id,))
+    return subjects, topics
 
+subjects, topics = load_subjects_topics_for_exam(st.session_state.exam_id)
+
+page = st.sidebar.radio("Abas", [f"{current_exam_name} (todas)", "Tabela 1 — Painel Geral", "Tabela 2 — Revisões", "Tabela 3 — Evolução", "Configuração"])
+
+def render_tabela1():
+    st.header("📌 Tabela 1: Painel Geral de Performance e Execução")
     if subjects.empty:
-        st.info("Cadastre suas matérias em **Configuração → Cadastros**.")
-        st.stop()
+        st.info("Cadastre suas matérias em **Configuração**.")
+        return
     if topics.empty:
-        st.info("Cadastre seus assuntos em **Configuração → Cadastros**.")
-        st.stop()
+        st.info("Cadastre seus assuntos em **Configuração**.")
+        return
 
     planning = compute_suggested_hours(topics, weekly_hours_available)
-
-    st.subheader("Planejamento (checkbox + override)")
-    editable = planning[[
-        "subject","weight","exam_questions","difficulty","topic","hours_suggested","planned_hours","studied","pct_plan"
-    ]].copy()
-
+    editable = planning[["subject","weight","exam_questions","difficulty","topic","hours_suggested","planned_hours","studied","pct_plan"]].copy()
     editable.rename(columns={
         "subject":"Matéria",
         "weight":"Peso (Importância na prova)",
@@ -301,7 +365,6 @@ if page == "Tabela 1 — Painel Geral":
         st.success("Alterações salvas ✅")
         st.rerun()
 
-    st.divider()
     st.subheader("Totais")
     total_questions = int(subjects["exam_questions"].sum())
     c1, c2, c3 = st.columns(3)
@@ -309,7 +372,7 @@ if page == "Tabela 1 — Painel Geral":
     c2.metric("Total de Questões da Prova", f"{total_questions}")
     c3.metric("Assuntos estudados (checkbox)", f"{int(planning['studied'].sum())}/{len(planning)}")
 
-    st.subheader("📈 Análise de Custo-Benefício (ganhar pontos mais rápido)")
+    st.subheader("📈 Análise de Custo-Benefício")
     cb = cost_benefit_ranking(planning)
     cb_view = cb[["subject","topic","weight","exam_questions","difficulty","hours_suggested","pct_plan","cb_score"]].copy()
     cb_view.rename(columns={
@@ -318,18 +381,13 @@ if page == "Tabela 1 — Painel Geral":
     }, inplace=True)
     st.dataframe(cb_view.head(12), use_container_width=True, hide_index=True)
 
-# ---------------------------
-# TABELA 2
-# ---------------------------
-elif page == "Tabela 2 — Revisões":
-    st.title("🔁 Tabela 2: Revisões e Desempenho")
-
+def render_tabela2():
+    st.header("🔁 Tabela 2: Revisões e Desempenho")
     if topics.empty:
-        st.info("Cadastre matérias e assuntos em **Configuração → Cadastros**.")
-        st.stop()
+        st.info("Cadastre matérias e assuntos em **Configuração**.")
+        return
 
     intervals = parse_intervals()
-
     perf = load_df("""
         SELECT t.id as topic_id, s.name as subject, t.name as topic,
                MIN(r.study_date) as first_study_date,
@@ -338,12 +396,12 @@ elif page == "Tabela 2 — Revisões":
         FROM topics t
         JOIN subjects s ON s.id = t.subject_id
         LEFT JOIN study_records r ON r.topic_id = t.id
+        WHERE s.exam_id=?
         GROUP BY t.id, s.name, t.name
         ORDER BY s.name, t.name
-    """)
+    """, (st.session_state.exam_id,))
     perf["pct_correct"] = perf.apply(lambda x: (x["correct"]/x["questions_done"]*100.0) if x["questions_done"] else 0.0, axis=1)
 
-    # Ensure revisions exist where possible
     for _, row in perf.iterrows():
         if row["first_study_date"]:
             ensure_revisions_for_topic(int(row["topic_id"]), date.fromisoformat(row["first_study_date"]))
@@ -354,12 +412,12 @@ elif page == "Tabela 2 — Revisões":
         FROM revisions rv
         JOIN topics t ON t.id = rv.topic_id
         JOIN subjects s ON s.id = t.subject_id
+        WHERE s.exam_id=?
         ORDER BY s.name, t.name, rv.interval_days
-    """)
+    """, (st.session_state.exam_id,))
     if not revs.empty:
         revs["due_date"] = pd.to_datetime(revs["due_date"]).dt.date
 
-    # Build wide table of due dates
     if revs.empty:
         wide = perf[["subject","topic"]].copy()
         for d in intervals:
@@ -382,45 +440,33 @@ elif page == "Tabela 2 — Revisões":
         "pct_correct":"% de Acerto"
     }, inplace=True)
     wide.rename(columns={"subject":"Matéria/Assunto","topic":"Assunto"}, inplace=True)
-
     df2 = perf_view.merge(wide, on=["Matéria/Assunto","Assunto"], how="left")
     st.dataframe(df2, use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.subheader("📅 Google Calendar — botões (dia inteiro) + criar tudo de uma vez")
-
-    # One-click to show panel for all topics
+    st.subheader("📅 Google Calendar — criar tudo de uma vez")
     if "show_all_batch" not in st.session_state:
         st.session_state.show_all_batch = False
-
-    if st.button("⚡ Criar revisões em lote para TODOS (gera painel de botões)"):
+    if st.button("⚡ Gerar painel de botões para TODOS os assuntos"):
         st.session_state.show_all_batch = True
 
-    # Single topic batch
     labels = perf.apply(lambda r: f"{r['subject']} — {r['topic']}", axis=1).tolist()
-    chosen = st.selectbox("Escolha um assunto para gerar TODAS as revisões", labels)
-    chosen_row = perf.iloc[labels.index(chosen)]
-    if chosen_row["first_study_date"]:
-        base_date = date.fromisoformat(chosen_row["first_study_date"])
-        materia = chosen_row["subject"]
-        assunto = chosen_row["topic"]
+    if labels:
+        chosen = st.selectbox("Escolha um assunto para gerar TODAS as revisões", labels)
+        chosen_row = perf.iloc[labels.index(chosen)]
+        if chosen_row["first_study_date"]:
+            base_date = date.fromisoformat(chosen_row["first_study_date"])
+            materia = chosen_row["subject"]
+            assunto = chosen_row["topic"]
+            if st.button("📌 Gerar botões deste assunto"):
+                cols = st.columns(len(intervals))
+                for i, d in enumerate(intervals):
+                    rev_date = base_date + timedelta(days=int(d))
+                    link = google_calendar_event_link(materia, assunto, rev_date, int(d))
+                    cols[i].link_button(f"{d}d", link, use_container_width=True)
+        else:
+            st.warning("Sem data do estudo inicial. Registre um estudo em Configuração.")
 
-        if st.button("📌 Gerar botões deste assunto (24h, 7d, 15d...)"):
-            st.session_state["single_batch"] = (materia, assunto, base_date)
-
-        if st.session_state.get("single_batch"):
-            materia, assunto, base_date = st.session_state["single_batch"]
-            cols = st.columns(len(intervals))
-            for i, d in enumerate(intervals):
-                rev_date = base_date + timedelta(days=int(d))
-                link = google_calendar_event_link(materia, assunto, rev_date, int(d))
-                cols[i].link_button(f"{d}d", link, use_container_width=True)
-    else:
-        st.warning("Esse assunto ainda não tem data do estudo inicial. Registre um estudo em **Configuração → Registrar estudo**.")
-
-    # All topics panel
     if st.session_state.show_all_batch:
-        st.divider()
         st.subheader("Painel em lote — todos os assuntos com estudo inicial")
         for _, row in perf.iterrows():
             if not row["first_study_date"]:
@@ -435,15 +481,11 @@ elif page == "Tabela 2 — Revisões":
                     link = google_calendar_event_link(materia, assunto, rev_date, int(d))
                     cols[i].link_button(f"{d}d", link, use_container_width=True)
 
-# ---------------------------
-# TABELA 3
-# ---------------------------
-elif page == "Tabela 3 — Evolução":
-    st.title("📊 Tabela 3: Acompanhamento de Evolução e Métricas")
-
+def render_tabela3():
+    st.header("📊 Tabela 3: Acompanhamento de Evolução e Métricas")
     if topics.empty:
-        st.info("Cadastre matérias e assuntos em **Configuração → Cadastros**.")
-        st.stop()
+        st.info("Cadastre matérias e assuntos em **Configuração**.")
+        return
 
     topic_minutes = load_df("""
         SELECT t.id as topic_id,
@@ -454,7 +496,6 @@ elif page == "Tabela 3 — Evolução":
         LEFT JOIN study_records r ON r.topic_id = t.id
         GROUP BY t.id
     """)
-
     base = topics.merge(topic_minutes, on="topic_id", how="left").fillna({"minutes_done":0,"q_done":0,"correct":0})
     planning = compute_suggested_hours(base, weekly_hours_available)
 
@@ -494,7 +535,6 @@ elif page == "Tabela 3 — Evolução":
         }
     )
 
-    st.divider()
     st.subheader("Resumo de Evolução Total (Final)")
     total_topics = int(subj["total_topics"].sum())
     total_studied = int(subj["studied_topics"].sum())
@@ -507,7 +547,7 @@ elif page == "Tabela 3 — Evolução":
         WHERE study_date >= ?
         GROUP BY study_date
     """, ((date.today() - timedelta(days=6)).isoformat(),))
-    pace = float(last7["minutes"].mean()) if len(last7) else 0.0  # minutes/day
+    pace = float(last7["minutes"].mean()) if len(last7) else 0.0
 
     remaining_hours = float(subj["hours_remaining"].sum())
     remaining_minutes = remaining_hours * 60.0
@@ -522,18 +562,47 @@ elif page == "Tabela 3 — Evolução":
     else:
         c3.metric("Estimativa de tempo para fechar", "Sem dados", help="Registre estudos para calcular o ritmo.")
 
-# ---------------------------
-# CONFIGURAÇÃO
-# ---------------------------
+# Pages
+if page == f"{current_exam_name} (todas)":
+    st.title(f"🏁 {current_exam_name}")
+    t1, t2, t3 = st.tabs(["Tabela 1", "Tabela 2", "Tabela 3"])
+    with t1: render_tabela1()
+    with t2: render_tabela2()
+    with t3: render_tabela3()
+elif page == "Tabela 1 — Painel Geral":
+    st.title(f"📌 {current_exam_name} — Tabela 1")
+    render_tabela1()
+elif page == "Tabela 2 — Revisões":
+    st.title(f"🔁 {current_exam_name} — Tabela 2")
+    render_tabela2()
+elif page == "Tabela 3 — Evolução":
+    st.title(f"📊 {current_exam_name} — Tabela 3")
+    render_tabela3()
 else:
     st.title("⚙️ Configuração")
 
+    st.subheader("Concursos (multi)")
+    with st.form("add_exam"):
+        new_exam = st.text_input("Adicionar novo concurso", placeholder="Ex.: TRT 7 — Analista")
+        ok = st.form_submit_button("Adicionar")
+        if ok:
+            if not new_exam.strip():
+                st.error("Digite um nome de concurso.")
+            else:
+                exec_sql("INSERT OR IGNORE INTO exams(name, created_at) VALUES (?,?)",
+                         (new_exam.strip(), datetime.now().isoformat(timespec="seconds")))
+                st.success("Concurso adicionado ✅")
+                st.rerun()
+
+    st.divider()
     st.subheader("Parâmetros do planejamento")
     c1, c2 = st.columns(2)
     with c1:
-        weekly = st.number_input("Horas semanais disponíveis (para distribuir no plano)", min_value=1.0, step=1.0, value=float(get_setting("weekly_hours_available","20")))
+        weekly = st.number_input("Horas semanais disponíveis (para distribuir no plano)", min_value=1.0, step=1.0,
+                                 value=float(get_setting("weekly_hours_available","20")))
     with c2:
-        intervals_txt = st.text_input("Intervalos de revisão (dias) separados por vírgula", value=",".join(map(str, parse_intervals())))
+        intervals_txt = st.text_input("Intervalos de revisão (dias) separados por vírgula",
+                                      value=",".join(map(str, parse_intervals())))
     if st.button("Salvar parâmetros"):
         set_setting("weekly_hours_available", weekly)
         xs = []
@@ -550,7 +619,7 @@ else:
         st.success("Salvo ✅")
 
     st.divider()
-    st.subheader("Cadastros")
+    st.subheader(f"Cadastros — {current_exam_name}")
 
     with st.expander("➕ Cadastrar/editar matérias"):
         with st.form("add_subject"):
@@ -565,58 +634,69 @@ else:
                 else:
                     con = db()
                     con.execute("""
-                        INSERT INTO subjects(name,weight,exam_questions,difficulty)
-                        VALUES (?,?,?,?)
-                        ON CONFLICT(name) DO UPDATE SET weight=excluded.weight, exam_questions=excluded.exam_questions, difficulty=excluded.difficulty
-                    """, (name.strip(), int(weight), int(exam_q), difficulty))
+                        INSERT INTO subjects(exam_id,name,weight,exam_questions,difficulty)
+                        VALUES (?,?,?,?,?)
+                        ON CONFLICT(exam_id,name) DO UPDATE SET weight=excluded.weight, exam_questions=excluded.exam_questions, difficulty=excluded.difficulty
+                    """, (st.session_state.exam_id, name.strip(), int(weight), int(exam_q), difficulty))
                     con.commit()
                     con.close()
                     st.success("Matéria salva ✅")
                     st.rerun()
 
-        st.dataframe(load_df("SELECT name as Matéria, weight as Peso, exam_questions as Questões, difficulty as Dificuldade FROM subjects ORDER BY name;"),
+        st.dataframe(load_df("SELECT name as Matéria, weight as Peso, exam_questions as Questões, difficulty as Dificuldade FROM subjects WHERE exam_id=? ORDER BY name;",
+                             (st.session_state.exam_id,)),
                      use_container_width=True, hide_index=True)
 
-    with st.expander("➕ Cadastrar/editar assuntos (por matéria)"):
-        if subjects.empty:
+    with st.expander("➕ Assuntos (com estilo de lote por ':')"):
+        subjects2 = load_df("SELECT * FROM subjects WHERE exam_id=? ORDER BY name;", (st.session_state.exam_id,))
+        if subjects2.empty:
             st.info("Cadastre ao menos 1 matéria primeiro.")
         else:
-            subj = st.selectbox("Escolha a matéria", subjects["name"].tolist())
-            subject_id = int(subjects.loc[subjects["name"]==subj, "id"].iloc[0])
+            subj = st.selectbox("Escolha a matéria", subjects2["name"].tolist())
+            subject_id = int(subjects2.loc[subjects2["name"]==subj, "id"].iloc[0])
 
-            with st.form("add_topic"):
-                topic = st.text_input("Assunto específico", "")
-                planned_hours = st.number_input("Horas override (opcional, 0 = automático)", min_value=0.0, step=0.5, value=0.0)
-                ok = st.form_submit_button("Salvar assunto")
-                if ok:
-                    if not topic.strip():
-                        st.error("Digite o assunto.")
+            st.markdown("**Adicionar vários assuntos de uma vez (cole texto separado por ':' )**")
+            with st.form("add_topic_bulk"):
+                bulk = st.text_area("Cole aqui (ex.: 1: Introdução: 2: Teoria: 3: Questões)", height=160)
+                planned_hours_bulk = st.number_input("Horas override para todos (opcional)", min_value=0.0, step=0.5, value=0.0)
+                ok2 = st.form_submit_button("Adicionar em lote")
+                if ok2:
+                    topics_list = parse_bulk_topics(bulk)
+                    if not topics_list:
+                        st.error("Não identifiquei assuntos. Use ':' (dois pontos) ou 1 por linha.")
                     else:
                         con = db()
-                        con.execute("""
-                            INSERT INTO topics(subject_id,name,planned_hours,studied,created_at)
-                            VALUES (?,?,?,?,?)
-                            ON CONFLICT(subject_id,name) DO UPDATE SET planned_hours=excluded.planned_hours
-                        """, (subject_id, topic.strip(), float(planned_hours), 0, datetime.now().isoformat(timespec="seconds")))
+                        for tname in topics_list:
+                            con.execute("""
+                                INSERT OR IGNORE INTO topics(subject_id,name,planned_hours,studied,created_at)
+                                VALUES (?,?,?,?,?)
+                            """, (subject_id, tname, float(planned_hours_bulk), 0, datetime.now().isoformat(timespec="seconds")))
                         con.commit()
                         con.close()
-                        st.success("Assunto salvo ✅")
+                        st.success(f"Assuntos adicionados ✅ ({len(topics_list)} detectados)")
                         st.rerun()
 
+            st.caption("Assuntos cadastrados nessa matéria:")
             st.dataframe(load_df("""
                 SELECT t.name as Assunto, t.planned_hours as HorasOverride, t.studied as Estudado
                 FROM topics t JOIN subjects s ON s.id=t.subject_id
-                WHERE s.name=?
+                WHERE s.exam_id=? AND s.name=?
                 ORDER BY t.name
-            """, (subj,)), use_container_width=True, hide_index=True)
+            """, (st.session_state.exam_id, subj)), use_container_width=True, hide_index=True)
 
     with st.expander("🕒 Registrar estudo (gera revisões automaticamente)"):
-        if topics.empty:
+        topics3 = load_df("""
+            SELECT t.id as topic_id, t.name as topic, s.name as subject
+            FROM topics t JOIN subjects s ON s.id=t.subject_id
+            WHERE s.exam_id=?
+            ORDER BY s.name, t.name
+        """, (st.session_state.exam_id,))
+        if topics3.empty:
             st.info("Cadastre assuntos primeiro.")
         else:
-            labels = topics.apply(lambda r: f"{r['subject']} — {r['topic']}", axis=1).tolist()
+            labels = topics3.apply(lambda r: f"{r['subject']} — {r['topic']}", axis=1).tolist()
             chosen = st.selectbox("Assunto", labels)
-            chosen_row = topics.iloc[labels.index(chosen)]
+            chosen_row = topics3.iloc[labels.index(chosen)]
             topic_id = int(chosen_row["topic_id"])
 
             with st.form("study_form"):
@@ -631,27 +711,3 @@ else:
                     add_study_record(topic_id, d, int(minutes), int(q), int(c), notes, bool(mark))
                     st.success("Estudo registrado! Revisões geradas ✅")
                     st.rerun()
-
-    st.divider()
-    st.subheader("Backup / Reset")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Baixar backup (XLSX)"):
-            subs = load_df("SELECT * FROM subjects;")
-            tps = load_df("SELECT * FROM topics;")
-            recs = load_df("SELECT * FROM study_records;")
-            revs = load_df("SELECT * FROM revisions;")
-            out = DATA_DIR / "backup.xlsx"
-            with pd.ExcelWriter(out, engine="openpyxl") as w:
-                subs.to_excel(w, index=False, sheet_name="subjects")
-                tps.to_excel(w, index=False, sheet_name="topics")
-                recs.to_excel(w, index=False, sheet_name="study_records")
-                revs.to_excel(w, index=False, sheet_name="revisions")
-            st.download_button("Download backup.xlsx", data=out.read_bytes(), file_name="backup.xlsx")
-    with c2:
-        if st.button("Resetar tudo (apaga DB)"):
-            if DB_PATH.exists():
-                DB_PATH.unlink()
-            init_db()
-            st.success("Reset feito ✅")
-            st.rerun()
